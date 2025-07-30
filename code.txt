@@ -1,0 +1,70 @@
+import pandas as pd
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+# Charger le modèle
+model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+
+# Charger les données q/a
+df = pd.read_csv('/content/drive/My Drive/NOVA/Message_Sequences_BETTER_INPUT.csv')
+
+# Fonction principale
+def get_top_4_and_best_central(df, input_message):
+    sub_df = df
+    if sub_df.empty:
+        return None
+
+    input_embedding = model.encode(input_message, convert_to_tensor=True)
+    ex_embeddings = model.encode(sub_df["Ex_Content"].tolist(), convert_to_tensor=True)
+
+    # Similarité cosinus
+    similarities = util.cos_sim(input_embedding, ex_embeddings)[0].cpu().numpy()
+
+    # Ajout des scores dans la DataFrame temporaire
+    sub_df = sub_df.copy()
+    sub_df["similarity"] = [round(float(s), 3) for s in similarities]
+
+    # Trier par : similarity (desc)
+    def sort_key(row):
+        return (-row["similarity"])
+
+    sub_df = sub_df.sort_values(by=["similarity"], ascending=False)
+    sub_df = sub_df.head(50)  # préfiltrer
+    sub_df = sorted(sub_df.to_dict(orient="records"), key=sort_key)
+    top_4 = sub_df[:4]
+
+    # Encoder les New_Content
+    new_contents = [item["New_Content"] for item in top_4]
+    new_embeddings = model.encode(new_contents, convert_to_tensor=True)
+
+    # Calcul des distances moyennes
+    avg_distances = []
+    for i in range(len(new_embeddings)):
+        others = torch.cat([new_embeddings[:i], new_embeddings[i+1:]])
+        distances = 1 - util.cos_sim(new_embeddings[i], others)[0]
+        avg_dist = torch.mean(distances).item()
+        avg_distances.append(avg_dist)
+
+    # Affichage complet
+    print("\n4 Résultats (Ex_Content -> New_Content):")
+    for i, (item, dist) in enumerate(zip(top_10, avg_distances)):
+        print(f"{i+1}. \"{item['Ex_Content']}\" ({item['similarity']:.3f}) ➜ "
+              f"\"{item['New_Content']}\" (Dist. Moy: {dist:.4f})")
+
+    # Gagnant = celui avec la plus petite distance moyenne
+    best_index = avg_distances.index(min(avg_distances))
+    best_new = top_10[best_index]["New_Content"]
+    print(f"\n🏆 Gagnant (le plus central) : \"{best_new}\"")
+
+    return best_new
+
+# --- Boucle principale ---
+while True:
+    input_author = "utilisateur"
+    input_message = input("\n✉️ Votre message : ").strip()
+    print(f"\n👤 {input_author} : {input_message}")
+
+    result = get_top_4_and_best_central(df, input_message)
+
+    if result is None:
+        print("❌ Aucun résultat trouvé.")
