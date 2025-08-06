@@ -1,0 +1,4 @@
+1) Get your data with Ex_Content => New_Content
+2) Map your data
+3) Apply the nova algorithm on it for create a custom tchatbot
+
