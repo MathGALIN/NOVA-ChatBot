@@ -1,70 +1,347 @@
 import pandas as pd
 from sentence_transformers import SentenceTransformer, util
 import torch
+import sys
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
 
-# Charger le modèle
-model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
 
-# Charger les données q/a
-df = pd.read_csv('/content/drive/My Drive/NOVA/Message_Sequences_BETTER_INPUT.csv')
+class SemanticChat:
+    """
+    A semantic chat system that uses sentence transformers to find
+    the most relevant responses from a pre-existing dataset.
+    
+    The system works by:
+    1. Loading a dataset of question-answer pairs
+    2. Finding the top 4 most similar questions to user input
+    3. Selecting the most "central" answer among these top 4 results
+    
+    Attributes:
+        model (SentenceTransformer): The sentence transformer model
+        df (pd.DataFrame): The dataset containing Ex_Content and New_Content columns
+        model_name (str): Name of the sentence transformer model to use
+    """
+    
+    def __init__(self, model_name: str = 'paraphrase-multilingual-mpnet-base-v2'):
+        """
+        Initialize the SemanticChat system.
+        
+        Args:
+            model_name (str): Name of the sentence transformer model to use.
+                            Default is 'paraphrase-multilingual-mpnet-base-v2'
+        """
+        self.model_name = model_name
+        self.model = None
+        self.df = None
+        
+    def load_model(self) -> None:
+        """
+        Load the sentence transformer model.
+        
+        Raises:
+            Exception: If the model cannot be loaded
+        """
+        try:
+            print(f"🔄 Loading model: {self.model_name}...")
+            self.model = SentenceTransformer(self.model_name)
+            print("✅ Model loaded successfully")
+        except Exception as e:
+            raise Exception(f"Failed to load model: {e}")
+    
+    def load_data(self, csv_path: str) -> None:
+        """
+        Load the dataset from a CSV file.
+        
+        The CSV file should contain at least two columns:
+        - Ex_Content: Original questions/messages
+        - New_Content: Corresponding responses/answers
+        
+        Args:
+            csv_path (str): Path to the CSV file containing the dataset
+            
+        Raises:
+            FileNotFoundError: If the CSV file doesn't exist
+            ValueError: If required columns are missing
+        """
+        try:
+            print(f"📂 Loading data from: {csv_path}")
+            
+            if not Path(csv_path).exists():
+                raise FileNotFoundError(f"CSV file not found: {csv_path}")
+                
+            self.df = pd.read_csv(csv_path)
+            
+            # Validate required columns
+            required_columns = ['Ex_Content', 'New_Content']
+            missing_columns = [col for col in required_columns if col not in self.df.columns]
+            
+            if missing_columns:
+                raise ValueError(f"Missing required columns: {missing_columns}")
+                
+            # Remove rows with NaN values in required columns
+            initial_count = len(self.df)
+            self.df = self.df.dropna(subset=required_columns)
+            final_count = len(self.df)
+            
+            if initial_count > final_count:
+                print(f"⚠️  Removed {initial_count - final_count} rows with missing data")
+                
+            print(f"✅ Data loaded successfully: {final_count} entries available")
+            
+        except Exception as e:
+            raise Exception(f"Failed to load data: {e}")
+    
+    def get_semantic_response(self, input_message: str, top_k: int = 4, 
+                            candidates_pool: int = 50) -> Optional[Tuple[str, Dict]]:
+        """
+        Find the most semantically relevant response for the input message.
+        
+        Algorithm:
+        1. Encode the input message and all Ex_Content entries
+        2. Calculate cosine similarities
+        3. Select top candidates_pool most similar entries
+        4. From these, take the top_k entries
+        5. Find the most "central" response among top_k by minimizing
+           average distance to other responses in the group
+        
+        Args:
+            input_message (str): The user's input message
+            top_k (int): Number of top results to consider for centrality calculation
+            candidates_pool (int): Size of the initial candidate pool
+            
+        Returns:
+            Tuple[str, Dict] or None: A tuple containing:
+                - The most relevant response (str)
+                - Metadata dictionary with similarity scores and details
+            Returns None if no results found or if system is not initialized
+        """
+        if self.model is None or self.df is None:
+            print("❌ System not initialized. Please load model and data first.")
+            return None
+            
+        if self.df.empty:
+            print("❌ No data available.")
+            return None
+            
+        if not input_message.strip():
+            print("⚠️  Empty input message.")
+            return None
+        
+        try:
+            # Encode input message and dataset
+            input_embedding = self.model.encode(input_message, convert_to_tensor=True)
+            ex_embeddings = self.model.encode(self.df["Ex_Content"].tolist(), convert_to_tensor=True)
+            
+            # Calculate cosine similarities
+            similarities = util.cos_sim(input_embedding, ex_embeddings)[0].cpu().numpy()
+            
+            # Create result DataFrame with similarity scores
+            result_df = self.df.copy()
+            result_df["similarity"] = [round(float(s), 4) for s in similarities]
+            
+            # Get top candidates
+            result_df = result_df.sort_values(by=["similarity"], ascending=False).head(candidates_pool)
+            top_results = result_df.to_dict(orient="records")
+            top_k_results = top_results[:top_k]
+            
+            if not top_k_results:
+                return None
+            
+            # Find the most central response among top_k
+            best_result, centrality_scores = self._find_most_central_response(top_k_results)
+            
+            # Prepare metadata
+            metadata = {
+                'similarity_score': best_result['similarity'],
+                'original_question': best_result['Ex_Content'],
+                'centrality_score': min(centrality_scores),
+                'top_candidates': top_k_results,
+                'centrality_scores': centrality_scores
+            }
+            
+            return best_result["New_Content"], metadata
+            
+        except Exception as e:
+            print(f"❌ Error during semantic search: {e}")
+            return None
+    
+    def _find_most_central_response(self, candidates: List[Dict]) -> Tuple[Dict, List[float]]:
+        """
+        Find the most central response among a list of candidates.
+        
+        Centrality is measured by the average distance to all other responses
+        in the candidate set. The response with the minimum average distance
+        is considered most central.
+        
+        Args:
+            candidates (List[Dict]): List of candidate responses with their metadata
+            
+        Returns:
+            Tuple[Dict, List[float]]: The most central candidate and list of centrality scores
+        """
+        # Encode all New_Content responses
+        new_contents = [item["New_Content"] for item in candidates]
+        new_embeddings = self.model.encode(new_contents, convert_to_tensor=True)
+        
+        # Calculate average distances (centrality scores)
+        centrality_scores = []
+        for i in range(len(new_embeddings)):
+            # Get all embeddings except the current one
+            others = torch.cat([new_embeddings[:i], new_embeddings[i+1:]])
+            
+            if len(others) > 0:  # Avoid division by zero
+                # Calculate distances (1 - cosine similarity)
+                distances = 1 - util.cos_sim(new_embeddings[i], others)[0]
+                avg_distance = torch.mean(distances).item()
+            else:
+                avg_distance = 0.0
+                
+            centrality_scores.append(avg_distance)
+        
+        # Find the candidate with minimum average distance (most central)
+        best_index = centrality_scores.index(min(centrality_scores))
+        return candidates[best_index], centrality_scores
+    
+    def print_detailed_results(self, input_message: str, result: str, metadata: Dict) -> None:
+        """
+        Print detailed information about the search results.
+        
+        Args:
+            input_message (str): Original user input
+            result (str): The selected response
+            metadata (Dict): Metadata containing search details
+        """
+        print(f"\n👤 User Input: \"{input_message}\"")
+        print("=" * 60)
+        
+        print(f"\n📊 Top {len(metadata['top_candidates'])} candidates:")
+        for i, (candidate, centrality) in enumerate(zip(metadata['top_candidates'], metadata['centrality_scores'])):
+            marker = "🏆" if candidate['Ex_Content'] == metadata['original_question'] else "  "
+            print(f"{marker} {i+1}. \"{candidate['Ex_Content']}\" (Similarity: {candidate['similarity']:.4f})")
+            print(f"     ➜ \"{candidate['New_Content']}\" (Centrality: {centrality:.4f})")
+            print()
+        
+        print(f"🎯 Selected Response:")
+        print(f"   Matched Question: \"{metadata['original_question']}\"")
+        print(f"   Response: \"{result}\"")
+        print(f"   Similarity Score: {metadata['similarity_score']:.4f}")
+        print(f"   Centrality Score: {metadata['centrality_score']:.4f}")
+    
+    def interactive_chat(self) -> None:
+        """
+        Start an interactive chat session.
+        
+        Allows users to input messages and receive semantic responses
+        until they choose to quit.
+        """
+        if self.model is None or self.df is None:
+            print("❌ System not initialized. Please load model and data first.")
+            return
+            
+        print("\n💬 Semantic Chat System - Interactive Mode")
+        print("Commands: 'quit', 'exit', 'q' to quit | 'help' for help")
+        print("=" * 60)
+        
+        while True:
+            try:
+                input_message = input("\n✉️  Your message: ").strip()
+                
+                # Handle special commands
+                if input_message.lower() in ['quit', 'exit', 'q']:
+                    print("\n👋 Goodbye!")
+                    break
+                    
+                if input_message.lower() == 'help':
+                    self._print_help()
+                    continue
+                    
+                if not input_message:
+                    print("⚠️  Please enter a message.")
+                    continue
+                
+                # Get semantic response
+                print("\n🔍 Searching for semantic match...")
+                response_data = self.get_semantic_response(input_message)
+                
+                if response_data is None:
+                    print("❌ No suitable response found.")
+                else:
+                    response, metadata = response_data
+                    self.print_detailed_results(input_message, response, metadata)
+                    
+            except KeyboardInterrupt:
+                print("\n\n👋 Chat interrupted by user. Goodbye!")
+                break
+            except Exception as e:
+                print(f"❌ Unexpected error: {e}")
+    
+    def _print_help(self) -> None:
+        """Print help information for the interactive chat."""
+        help_text = """
+📖 Help - Semantic Chat System
 
-# Fonction principale
-def get_top_4_and_best_central(df, input_message):
-    sub_df = df
-    if sub_df.empty:
-        return None
+This system finds the most relevant responses from a pre-trained dataset
+based on semantic similarity to your input.
 
-    input_embedding = model.encode(input_message, convert_to_tensor=True)
-    ex_embeddings = model.encode(sub_df["Ex_Content"].tolist(), convert_to_tensor=True)
+How it works:
+1. Your message is compared against all questions in the database
+2. The top 4 most similar questions are selected
+3. Among their answers, the most "central" one is chosen
+4. This ensures both relevance and representativeness
 
-    # Similarité cosinus
-    similarities = util.cos_sim(input_embedding, ex_embeddings)[0].cpu().numpy()
+Commands:
+- Type any message to get a response
+- 'help' - Show this help
+- 'quit', 'exit', 'q' - Exit the chat
 
-    # Ajout des scores dans la DataFrame temporaire
-    sub_df = sub_df.copy()
-    sub_df["similarity"] = [round(float(s), 3) for s in similarities]
+Tips:
+- Be specific in your questions for better matches
+- The system works in multiple languages
+- Similarity scores range from 0 (no similarity) to 1 (identical)
+        """
+        print(help_text)
 
-    # Trier par : similarity (desc)
-    def sort_key(row):
-        return (-row["similarity"])
 
-    sub_df = sub_df.sort_values(by=["similarity"], ascending=False)
-    sub_df = sub_df.head(50)  # préfiltrer
-    sub_df = sorted(sub_df.to_dict(orient="records"), key=sort_key)
-    top_4 = sub_df[:4]
+def main():
+    """
+    Main function to run the Semantic Chat System.
+    
+    This function handles the initialization and execution of the chat system,
+    including error handling and user interaction.
+    """
+    # Configuration
+    CSV_PATH = 'YOUR CSV PATH.csv'
+    MODEL_NAME = 'paraphrase-multilingual-mpnet-base-v2'
+    
+    try:
+        # Initialize the chat system
+        print("🚀 Initializing Semantic Chat System...")
+        chat_system = SemanticChat(model_name=MODEL_NAME)
+        
+        # Load model and data
+        chat_system.load_model()
+        chat_system.load_data(CSV_PATH)
+        
+        print("\n🎉 System ready!")
+        
+        # Start interactive chat
+        chat_system.interactive_chat()
+        
+    except FileNotFoundError as e:
+        print(f"❌ File Error: {e}")
+        print("💡 Please check that the CSV file exists and the path is correct.")
+        
+    except ValueError as e:
+        print(f"❌ Data Error: {e}")
+        print("💡 Please ensure your CSV has 'Ex_Content' and 'New_Content' columns.")
+        
+    except Exception as e:
+        print(f"❌ Unexpected Error: {e}")
+        print("💡 Please check your environment setup and try again.")
+        
+    finally:
+        print("\n🔚 Program terminated.")
 
-    # Encoder les New_Content
-    new_contents = [item["New_Content"] for item in top_4]
-    new_embeddings = model.encode(new_contents, convert_to_tensor=True)
 
-    # Calcul des distances moyennes
-    avg_distances = []
-    for i in range(len(new_embeddings)):
-        others = torch.cat([new_embeddings[:i], new_embeddings[i+1:]])
-        distances = 1 - util.cos_sim(new_embeddings[i], others)[0]
-        avg_dist = torch.mean(distances).item()
-        avg_distances.append(avg_dist)
-
-    # Affichage complet
-    print("\n4 Résultats (Ex_Content -> New_Content):")
-    for i, (item, dist) in enumerate(zip(top_10, avg_distances)):
-        print(f"{i+1}. \"{item['Ex_Content']}\" ({item['similarity']:.3f}) ➜ "
-              f"\"{item['New_Content']}\" (Dist. Moy: {dist:.4f})")
-
-    # Gagnant = celui avec la plus petite distance moyenne
-    best_index = avg_distances.index(min(avg_distances))
-    best_new = top_10[best_index]["New_Content"]
-    print(f"\n🏆 Gagnant (le plus central) : \"{best_new}\"")
-
-    return best_new
-
-# --- Boucle principale ---
-while True:
-    input_author = "utilisateur"
-    input_message = input("\n✉️ Votre message : ").strip()
-    print(f"\n👤 {input_author} : {input_message}")
-
-    result = get_top_4_and_best_central(df, input_message)
-
-    if result is None:
-        print("❌ Aucun résultat trouvé.")
+if __name__ == "__main__":
+    main()
